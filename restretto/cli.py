@@ -28,10 +28,11 @@ from .fragment_grid import (
     build_offline_schedule,
     make_distance_grid,
 )
+from .fragment_grid_6d import FragmentInterEnergyGrid6D, build_fragment_rotation_cache, nearest_fragment_rotation_bin
 from .geometry import Point3d, Vector3d, ceili, round_half_up
 from .grid import InterEnergyGrid
 from .io import _canonical_smiles, _to_obmol, canonical_labels, read_molecules, write_sdf_like
-from .optimizer import OptimizerGrid
+from .optimizer import OptimizerFragmentGrid6D, OptimizerGrid
 from .rotation import make_initial_rotations, make_rotations_60
 
 
@@ -233,6 +234,8 @@ def conformer_docking(args):
     conf, receptor, ligands = _load_inputs_from_conf(args.config, conf)
     if conf.score_only or conf.local_only:
         scored = _dock_with_atom_grids(args.config, conf, ligands)
+    elif getattr(args, "full_rotation", False):
+        scored = _dock_with_fragment_grids_6d(args.config, conf, receptor, ligands)
     else:
         scored = _dock_with_fragment_grids(args.config, conf, receptor, ligands)
     output = Path(conf.output_file)
@@ -409,6 +412,14 @@ def _fragment_grid_storage_size(conf, score_num):
     return max(1, count)
 
 
+def _fragment_grid_6d_storage_size(conf, score_num, rotation_count):
+    rotation_count = max(1, int(rotation_count))
+    count = int((conf.mem_size * 1024 * 1024) / (int(score_num.x) * int(score_num.y) * int(score_num.z) * rotation_count * 4))
+    if conf.reuse_grid == ReuseStrategy.NONE:
+        return 1
+    return max(1, count)
+
+
 def _prepare_fragment_library(ligands, reorder=True):
     fragvecs = []
     frag_library = []
@@ -421,6 +432,10 @@ def _prepare_fragment_library(ligands, reorder=True):
             ob_fragment = _to_obmol(fragment)
             fragment.smiles = _canonical_smiles(ob_fragment)
             labels = canonical_labels(ob_fragment)
+            atom_ids = [-1 for _ in range(fragment.size)]
+            for old_idx, label in enumerate(labels):
+                if label:
+                    atom_ids[int(label) - 1] = fragment.atoms[old_idx].id
             fragment.renumbering(fragment.size, labels)
             signature = fragment.smiles or _fragment_signature(fragment)
             if signature in fragmap:
@@ -434,7 +449,16 @@ def _prepare_fragment_library(ligands, reorder=True):
                 frag_library.append(normalized)
                 frag_importance.append(0)
             fragment.idx = frag_idx
-            ligand_fragvecs.append({"pos": fragment.center(), "frag_idx": frag_idx, "size": fragment.size, "rank": 0})
+            ligand_fragvecs.append(
+                {
+                    "pos": fragment.center(),
+                    "frag_idx": frag_idx,
+                    "size": fragment.size,
+                    "rank": 0,
+                    "fragment": fragment.copy(),
+                    "atom_ids": atom_ids,
+                }
+            )
         fragvecs.append(ligand_fragvecs)
 
     sorted_lig = list(range(len(ligands)))
@@ -569,6 +593,127 @@ def _dock_with_fragment_grids(config_path, conf, receptor, ligands):
     return [(mol, score) for score, mol in scored]
 
 
+def _rotated_fragment_occurrence(fragment, rotation):
+    occurrence = fragment.copy()
+    occurrence.rotate(rotation.x, rotation.y, rotation.z)
+    return occurrence
+
+
+def _dock_with_fragment_grids_6d(config_path, conf, receptor, ligands):
+    atom_grids = _read_atom_grids(config_path, conf)
+    score_num = atom_grids[0].num
+    search_num = _search_grid_num(conf)
+    ratio = _grid_ratio(conf)
+    search_grid = InterEnergyGrid(atom_grids[0].center, conf.grid.search_pitch, search_num, 0.0)
+    score_grid = InterEnergyGrid(atom_grids[0].center, atom_grids[0].pitch, score_num, 0.0)
+    distance_grid = make_distance_grid(atom_grids[0].center, atom_grids[0].pitch, score_num, receptor)
+    ligand_rotations = make_initial_rotations(filename=conf.rotangs_file or None)
+    fragment_rotations = make_rotations_60()
+    ec = EnergyCalculator(1.0)
+
+    bases = []
+    for ligand in ligands:
+        base = ligand.copy()
+        base.delete_hydrogens()
+        base.intra_energy = ec.calc_intra_energy(base)
+        center = base.center()
+        base.translate(Vector3d(-center.x, -center.y, -center.z))
+        bases.append(base)
+
+    frag_library, fragvecs, sorted_lig = _prepare_fragment_library(bases, conf.reorder)
+    rotation_caches = [build_fragment_rotation_cache(fragment, fragment_rotations) for fragment in frag_library]
+    cache_size = _fragment_grid_6d_storage_size(conf, score_num, len(fragment_rotations))
+    if conf.reuse_grid == ReuseStrategy.OFFLINE:
+        sequences = [[(item["frag_idx"], item["size"] * len(fragment_rotations)) for item in fragvecs[idx]] for idx in sorted_lig]
+        schedule = build_offline_schedule(sequences, cache_size, len(frag_library))
+        container = FragmentInterEnergyGridContainer(cache_size, schedule)
+    elif conf.reuse_grid == ReuseStrategy.ONLINE:
+        container = FragmentInterEnergyGridContainer(cache_size)
+    else:
+        container = FragmentInterEnergyGridContainer(1)
+
+    grids_by_frag = {}
+    scored = []
+    score_start = _to_score_num(0, score_num, search_num, ratio)
+
+    for lig_idx in sorted_lig:
+        base = bases[lig_idx]
+        frag_list = fragvecs[lig_idx]
+        scores = [
+            InterEnergyGrid(atom_grids[0].center, conf.grid.search_pitch, search_num, base.intra_energy)
+            for _ in ligand_rotations
+        ]
+        rel_pos = []
+        rel_rot = []
+        for rotation in ligand_rotations:
+            offsets = []
+            rotation_bins = []
+            for item in frag_list:
+                rotated_pos = item["pos"].rotated(rotation.x, rotation.y, rotation.z)
+                offsets.append(_round_fragment_offset(rotated_pos, conf.grid.score_pitch))
+                occurrence = _rotated_fragment_occurrence(item["fragment"], rotation)
+                rotation_bins.append(nearest_fragment_rotation_bin(rotation_caches[item["frag_idx"]], occurrence, fragment_rotations))
+            rel_pos.append(offsets)
+            rel_rot.append(rotation_bins)
+
+        for frag_idx, item in enumerate(frag_list):
+            fragid = item["frag_idx"]
+            if not container.is_registered(fragid):
+                container.insert(FragmentInterEnergyGrid6D(frag_library[fragid], fragment_rotations, atom_grids, distance_grid))
+            fg = container.get(fragid)
+            grids_by_frag[fragid] = fg
+            container.next()
+
+            for rotid in range(len(ligand_rotations)):
+                offset = rel_pos[rotid][frag_idx]
+                ridx = rel_rot[rotid][frag_idx]
+                scores[rotid].values3d()[:] += fg.sample_for_search(ridx, score_start, offset, ratio, search_num)
+
+        candidates = []
+        best_param = None
+        for rotid, rotation in enumerate(ligand_rotations):
+            for x in range(int(search_num.x)):
+                for y in range(int(search_num.y)):
+                    for z in range(int(search_num.z)):
+                        grid_score = scores[rotid].get_inter_energy(x, y, z)
+                        if best_param is None or grid_score < best_param[0]:
+                            best_param = (grid_score, rotid, x, y, z)
+                        if grid_score < conf.output_score_threshold:
+                            candidates.append((grid_score, rotid, x, y, z))
+        if not candidates and best_param is not None:
+            grid_score, rotid, x, y, z = best_param
+            candidates.append((grid_score, rotid, x, y, z))
+        candidates.sort(key=lambda item: item[0])
+        del candidates[int(conf.poses_per_lig_before_opt) :]
+
+        out_candidates = []
+        fragment_grids = [grids_by_frag.get(idx) for idx in range(len(frag_library))]
+        optimizer = OptimizerFragmentGrid6D(
+            score_grid,
+            fragment_grids,
+            rotation_caches,
+            frag_list,
+            fragment_rotations,
+            conf.local_max_rmsd,
+        )
+        for _, rotid, x, y, z in candidates[: int(conf.poses_per_lig_before_opt)]:
+            rotation = ligand_rotations[rotid]
+            pose = base.copy()
+            pose.rotate(rotation.x, rotation.y, rotation.z)
+            pose.translate(search_grid.convert(x, y, z))
+            total = optimizer.calc_total_energy(pose)
+            if not conf.no_local_opt:
+                total = optimizer.optimize(pose)
+            inter = total - base.intra_energy
+            score = inter / (1.0 + 0.05846 * base.nrots())
+            out_candidates.append((score, pose))
+        out_candidates.sort(key=lambda item: item[0])
+        scored.extend(_select_output_poses(out_candidates, conf.pose_min_rmsd, max(1, int(conf.poses_per_lig))))
+
+    scored.sort(key=lambda item: item[0])
+    return [(mol, score) for score, mol in scored]
+
+
 def _select_output_poses(scored_poses, pose_min_rmsd, max_poses):
     selected = []
     for score, pose in scored_poses:
@@ -677,6 +822,7 @@ def build_parser():
     dock.add_argument("--poses-per-lig-before-opt", type=int)
     dock.add_argument("--output-score-threshold", type=float)
     dock.add_argument("--dxgrid")
+    dock.add_argument("--full-rotation", action="store_true")
     dock.add_argument("config")
     dock.set_defaults(func=conformer_docking)
     decomp = sub.add_parser("decompose")

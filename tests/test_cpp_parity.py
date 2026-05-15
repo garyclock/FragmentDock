@@ -4,7 +4,7 @@ import shutil
 import tempfile
 import unittest
 
-from restretto.cli import main
+from restretto.cli import build_parser, main
 from restretto.config import DockingConfiguration
 from restretto.constants import XS_STRINGS, XS_TYPE_SIZE
 from restretto.geometry import Point3d, round_half_up, ceili
@@ -206,6 +206,13 @@ class CppParityTests(unittest.TestCase):
 
         with self.assertRaises(FileNotFoundError):
             main(["conformer-docking", str(config)])
+
+    def test_conformer_docking_accepts_full_rotation_flag(self):
+        parser = build_parser()
+
+        args = parser.parse_args(["conformer-docking", "--full-rotation", "testgrid.in"])
+
+        self.assertTrue(args.full_rotation)
 
     def test_decompose_accepts_cpp_style_arguments(self):
         tmpdir = Path(tempfile.mkdtemp())

@@ -4,6 +4,8 @@ import math
 
 from .constants import LIMIT_ENERGY, XS_TYPE_H
 from .geometry import Vector3d
+from .model import Atom, Molecule
+from .fragment_grid_6d import nearest_fragment_rotation_bin
 
 
 class _CRand:
@@ -42,6 +44,95 @@ class OptimizerGrid:
             if atom.xs_type == XS_TYPE_H:
                 continue
             total += self.atom_grids[atom.xs_type].get_inter_energy(atom)
+            if total >= LIMIT_ENERGY:
+                return LIMIT_ENERGY
+        return total
+
+    def calc_total_energy(self, mol):
+        return self.calc_inter_energy(mol) + mol.intra_energy
+
+    def optimize(self, mol):
+        rng = _CRand(0)
+        opt = self.calc_total_energy(mol)
+        nearest_num = 200
+        trans_step = 0.5
+        rotate_step = math.pi / 30.0
+        initial_mol = mol.copy()
+
+        while True:
+            next_val = 1e10
+            next_mol = mol.copy()
+            center = mol.center()
+            for _ in range(nearest_num):
+                dv = Vector3d(
+                    rng.randf(-trans_step, trans_step),
+                    rng.randf(-trans_step, trans_step),
+                    rng.randf(-trans_step, trans_step),
+                )
+                theta = rng.randf(-rotate_step, rotate_step)
+                phi = rng.randf(-rotate_step, rotate_step)
+                psi = rng.randf(-rotate_step, rotate_step)
+
+                tmp = mol.copy()
+                tmp.translate(-center)
+                tmp.rotate(theta, phi, psi)
+                tmp.translate(center + dv)
+
+                if initial_mol.calc_rmsd(tmp) > self.max_rmsd:
+                    continue
+
+                val = self.calc_total_energy(tmp)
+                if val < next_val:
+                    next_val = val
+                    next_mol = tmp
+
+            if next_val < opt:
+                opt = next_val
+                mol.atoms = next_mol.atoms
+                mol.bonds = next_mol.bonds
+                mol.bond_ids = next_mol.bond_ids
+            else:
+                break
+
+        return opt
+
+
+class OptimizerFragmentGrid6D:
+    def __init__(self, score_grid, fragment_grids, normalized_fragments, fragment_items, fragment_rotations, max_rmsd=1e10):
+        self.score_grid = score_grid
+        self.fragment_grids = list(fragment_grids)
+        self.normalized_fragments = list(normalized_fragments)
+        self.fragment_items = list(fragment_items)
+        self.fragment_rotations = list(fragment_rotations)
+        self.max_rmsd = float(max_rmsd)
+
+    def _occurrence_from_pose(self, mol, item):
+        atom_ids = item.get("atom_ids")
+        if atom_ids is None:
+            return item["fragment"].copy()
+        atom_by_id = {atom.id: atom for atom in mol.atoms}
+        atoms = []
+        for idx, atom_id in enumerate(atom_ids):
+            source = atom_by_id.get(atom_id)
+            if source is None:
+                continue
+            atoms.append(Atom(idx, source, source.xs_type))
+        return Molecule(atoms, mol.title, mol.smiles)
+
+    def calc_inter_energy(self, mol):
+        total = 0.0
+        for item in self.fragment_items:
+            frag_idx = item["frag_idx"]
+            fg = self.fragment_grids[frag_idx]
+            occurrence = self._occurrence_from_pose(mol, item)
+            ridx = nearest_fragment_rotation_bin(self.normalized_fragments[frag_idx], occurrence, self.fragment_rotations)
+            center = occurrence.center()
+            total += fg.get_inter_energy(
+                ridx,
+                self.score_grid.convert_x(center),
+                self.score_grid.convert_y(center),
+                self.score_grid.convert_z(center),
+            )
             if total >= LIMIT_ENERGY:
                 return LIMIT_ENERGY
         return total
