@@ -14,18 +14,11 @@ It currently supports:
 - `.mol2`, `.pdbqt`, `.pdb`, and `.sdf` reading through OpenBabel.
 - CLI commands: `atomgrid-gen`, `score-only`, `intraenergy-only`, `decompose`,
   `conformer-docking`, `atom-docking`, and `easytest-docking`.
-- Optional `conformer-docking --full-rotation` mode with deterministic 6D
-  translation/rotation candidate sampling.
 
 The docking command is a deterministic simplified pipeline: it reads receptor
 and ligand files with OpenBabel, scores input conformers, sorts them by score,
 and writes SDF output with OpenBabel. Full C++ parity for fragment reuse search
 and local optimization remains a future extension point.
-
-`--full-rotation` keeps the default docking path unchanged. When enabled, it
-generates deterministic Euler-angle bins, maps rotations by nearest neighbor
-without interpolation, applies energy-first tie-breaking, samples 6D
-translation/rotation candidates, and scores the resulting ligand poses.
 
 ## Environment
 
@@ -50,5 +43,4 @@ required runtime package is `openbabel-wheel`.
 ```powershell
 .venv\Scripts\python -m restretto.cli atomgrid-gen references\restretto\testdata\testgrid.in
 .venv\Scripts\python -m restretto.cli conformer-docking references\restretto\testdata\testgrid.in
-.venv\Scripts\python -m restretto.cli conformer-docking --full-rotation examples\testgrid_python.in
 ```

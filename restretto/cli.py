@@ -21,7 +21,6 @@ from .constants import (
     xs_radius,
 )
 from .decompose import decompose_molecule
-from .docking_full_rotation import dock_full_rotation
 from .energy import EnergyCalculator, PRECI, SZ, TERM_WEIGHTS, THRESHOLD
 from .fragment_grid import (
     FragmentInterEnergyGrid,
@@ -232,9 +231,7 @@ def decompose(args):
 def conformer_docking(args):
     conf = _apply_common_overrides(parse_in_file(args.config), args)
     conf, receptor, ligands = _load_inputs_from_conf(args.config, conf)
-    if getattr(args, "full_rotation", False):
-        scored = dock_full_rotation(conf, receptor, ligands)
-    elif conf.score_only or conf.local_only:
+    if conf.score_only or conf.local_only:
         scored = _dock_with_atom_grids(args.config, conf, ligands)
     else:
         scored = _dock_with_fragment_grids(args.config, conf, receptor, ligands)
@@ -665,7 +662,6 @@ def build_parser():
         cmd.add_argument("--memsize", "-m", type=int)
         cmd.set_defaults(func=func)
     dock = sub.add_parser("conformer-docking")
-    dock.add_argument("--full-rotation", action="store_true")
     dock.add_argument("--output", "-o")
     dock.add_argument("--ligand", "-l", nargs="+")
     dock.add_argument("--receptor", "-r")
