@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=75", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "restretto-py"
+version = "0.1.0"
+description = "Python reimplementation of core REstretto docking workflows"
+requires-python = ">=3.9"
+dependencies = [
+    "openbabel-wheel>=3.1.1.23",
+]
+
+[project.scripts]
+restretto = "restretto.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["restretto*"]
